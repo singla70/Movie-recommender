@@ -6,6 +6,46 @@ This README documents **every decision made during the audit/optimization pass**
 
 ---
 
+## 0. Full-stack layout (backend + Express API + React frontend)
+
+This repo now has three runnable pieces:
+
+```
+movie-graph-rag/
+├── app.js              ← original CLI chatbot (unchanged, still works: `npm start`)
+├── src/                ← core RAG logic (query + ingestion), shared by app.js AND the API
+│   └── query/queryEngine.js   ← stateless wrapper around app.js's query logic, used by server/
+├── server/              ← Express API (bridge for the React frontend)
+│   ├── index.js          ← routes: /api/query, /api/stats, /api/upload, /api/upload/status/:id, /api/connections
+│   └── ingestJob.js       ← background PDF-ingestion job runner (polled by the Admin UI)
+└── client/               ← React + Vite + Tailwind frontend ("Cinegraph")
+    └── src/
+        ├── pages/         ← Landing, QueryMode, AdminMode
+        └── components/
+```
+
+**Setup:**
+
+```bash
+# 1. Backend deps (from repo root)
+npm install
+
+# 2. Frontend deps
+npm run client:install
+
+# 3. Run the API server (port 4000, reads the same .env as app.js)
+npm run server
+
+# 4. In a second terminal, run the frontend dev server (port 5173, proxies /api → :4000)
+npm run client:dev
+```
+
+Then open `http://localhost:5173`. The CLI chatbot (`npm start`) still works independently and is untouched — the API server reuses the same `src/query/*` and `src/ingestion/*` modules through the new stateless `queryEngine.js`, rather than duplicating logic.
+
+`npm run client:build` builds the production frontend bundle into `client/dist/`.
+
+---
+
 ## 1. Architecture overview
 
 ```
