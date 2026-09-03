@@ -1,0 +1,36 @@
+{
+  "name": "movie-graph-rag",
+  "version": "1.0.0",
+  "description": "Hybrid AI Recommendation System — Neo4j + Pinecone + OpenRouter",
+  "main": "app.js",
+  "type": "module",
+  "scripts": {
+    "ingest": "node scripts/ingest.js",
+    "start": "node app.js",
+    "test:pinecone": "node tests/testPineconeConnection.js",
+    "test:neo4j": "node tests/testNeo4jConnection.js",
+    "test:embedding": "node tests/testEmbedding.js",
+    "test:llm": "node tests/testOpenRouter.js",
+    "test:pipeline": "node tests/testFullPipeline.js",
+    "test:all": "node scripts/testAllConnections.js",
+    "backfill:graph": "node scripts/backfillGraphRelations.js",
+    "migrate": "node scripts/migrate.js",
+    "wipe:pinecone": "node scripts/wipePinecone.js",
+    "wipe:neo4j": "node scripts/wipeNeo4j.js",
+    "load:cache": "node scripts/loadFromCache.js",
+    "rescue:neo4j": "node scripts/rescueFromNeo4j.js"
+  },
+  "dependencies": {
+    "@langchain/core": "^1.2.9",
+    "@langchain/langgraph": "^1.4.13",
+    "@langchain/openai": "^1.5.10",
+    "@pinecone-database/pinecone": "^7.2.0",
+    "dotenv": "^16.4.5",
+    "langchain": "^1.5.10",
+    "neo4j-driver": "^6.0.0",
+    "pdf-parse": "^1.1.1"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
