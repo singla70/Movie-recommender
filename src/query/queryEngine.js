@@ -75,23 +75,38 @@ async function executeSingleQuery(queryInfo, conversationHistory) {
 // Returns { answer, movies, route } — conversationHistory/lastMovies
 // hamesha caller se aate hain (server per-request client se milte
 // hain), koi module-level global state nahi.
-export async function processQuery(userQuery, conversationHistory = [], lastMovies = []) {
+//
+// onStage(stage): optional progress callback, called synchronously at
+// each real pipeline transition — NOT a fake/simulated timer. Default
+// no-op, so app.js (CLI) and any other caller that doesn't pass it
+// behaves exactly as before. Stages emitted:
+//   {stage:"understanding"}                        — routing decision in flight
+//   {stage:"responding", route:"greeting"}          — small-talk, single LLM call
+//   {stage:"responding", route:"off_topic"}         — redirect, single LLM call
+//   {stage:"searching",  route:"vector"|"graph"|"hybrid"|"multi_query"}
+//   {stage:"composing",  route:<same as above>}     — results in hand, writing the answer
+export async function processQuery(userQuery, conversationHistory = [], lastMovies = [], onStage = () => {}) {
+  onStage({ stage: "understanding" });
   const routing = await routeQuery(userQuery, conversationHistory);
 
   if (routing.query_type === "greeting") {
+    onStage({ stage: "responding", route: "greeting" });
     return { answer: await handleGreeting(userQuery), movies: [], route: "greeting" };
   }
   if (routing.query_type === "off_topic") {
+    onStage({ stage: "responding", route: "off_topic" });
     return { answer: await handleOffTopic(userQuery), movies: [], route: "off_topic" };
   }
 
   if (routing.is_multi_query && routing.queries.length > 1) {
+    onStage({ stage: "searching", route: "multi_query" });
     const queryPromises = routing.queries.map((q) =>
       executeSingleQuery(q, conversationHistory)
         .then((results) => ({ queryText: q.query_text, intent: q.intent, results }))
         .catch(() => ({ queryText: q.query_text, intent: q.intent, results: [] }))
     );
     const subQueryResults = await Promise.all(queryPromises);
+    onStage({ stage: "composing", route: "multi_query" });
     const sections = await buildMultiQueryResponse(subQueryResults, conversationHistory);
     const combinedAnswer = sections.map((s) => s.answer).join("\n\n");
     const allMovies = sections.flatMap((s) => s.movies || []);
@@ -114,10 +129,12 @@ export async function processQuery(userQuery, conversationHistory = [], lastMovi
     entities: rawQueryInfo.entities || defaultQuery.entities,
   };
 
+  onStage({ stage: "searching", route: queryInfo.route });
   const results = await executeSingleQuery(queryInfo, conversationHistory);
   const vectorResults = results.filter((r) => r.source === "vector" || r.source === "both");
   const graphResults = results.filter((r) => r.source === "graph" || r.source === "graph-text2cypher");
 
+  onStage({ stage: "composing", route: queryInfo.route });
   const response = await buildResponse(
     userQuery,
     vectorResults.length > 0 ? vectorResults : [],

@@ -1,8 +1,21 @@
-import { Film, User } from "lucide-react";
+import { Film, User, Sparkles, Network, Layers, ListTree, MessageCircle } from "lucide-react";
 import MovieRow from "./MovieRow.jsx";
+
+// Tells the user which store(s) actually answered their question —
+// not a raw internal string. "hybrid" reads as both databases,
+// because that's what the pipeline does for that route.
+const ROUTE_META = {
+  vector: { icon: Sparkles, label: "Searched Pinecone — semantic match" },
+  graph: { icon: Network, label: "Searched Neo4j — graph traversal" },
+  hybrid: { icon: Layers, label: "Searched Pinecone + Neo4j" },
+  multi_query: { icon: ListTree, label: "Answered as multiple sub-queries" },
+  greeting: { icon: MessageCircle, label: "Just chatting — no catalogue search" },
+  off_topic: { icon: MessageCircle, label: "Off-topic — no catalogue search" },
+};
 
 export default function ChatMessage({ role, text, movies, route }) {
   const isUser = role === "user";
+  const routeMeta = route ? ROUTE_META[route] : null;
 
   return (
     <div className={`flex gap-3 ${isUser ? "flex-row-reverse" : ""}`}>
@@ -29,9 +42,10 @@ export default function ChatMessage({ role, text, movies, route }) {
           <p className="whitespace-pre-wrap text-left">{text}</p>
         </div>
 
-        {!isUser && route && (
-          <div className="mt-1.5 font-mono text-[10px] tracking-wide text-theatre-faint">
-            {route}
+        {!isUser && routeMeta && (
+          <div className="mt-1.5 flex items-center gap-1.5 text-[10px] tracking-wide text-theatre-faint">
+            <routeMeta.icon size={11} strokeWidth={1.75} />
+            {routeMeta.label}
           </div>
         )}
 

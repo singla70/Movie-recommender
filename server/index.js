@@ -51,6 +51,9 @@ const upload = multer({
 });
 
 // ── POST /api/query ─────────────────────────────────────────
+// Plain request/response — kept for simplicity/backward-compatibility
+// (e.g. curl, non-browser clients). The web UI uses /api/query/stream
+// below so it can show real pipeline stages instead of guessing.
 app.post("/api/query", async (req, res) => {
   const { query_text, conversation_history } = req.body;
   if (!query_text || !query_text.trim()) {
@@ -66,6 +69,47 @@ app.post("/api/query", async (req, res) => {
   } catch (err) {
     console.error("Query error:", err);
     res.status(500).json({ error: err.message || "Query failed" });
+  }
+});
+
+// ── POST /api/query/stream ───────────────────────────────────
+// Same pipeline as /api/query, but streams real progress events as
+// Server-Sent Events while processQuery runs, then a final "done"
+// event with the same { answer, movies, route } payload. Each event
+// reflects an actual transition in queryEngine.js (routing decided,
+// which store is being searched, answer being composed) — not a
+// simulated/fake timer on the client.
+app.post("/api/query/stream", async (req, res) => {
+  const { query_text, conversation_history } = req.body;
+  if (!query_text || !query_text.trim()) {
+    return res.status(400).json({ error: "query_text is required" });
+  }
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+
+  const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
+
+  let closed = false;
+  req.on("close", () => { closed = true; }); // client cancelled — stop writing, let the query finish quietly
+
+  try {
+    const history = (conversation_history || []).map((m) => ({ role: m.role, content: m.content }));
+    const result = await processQuery(query_text.trim(), history, [], (stage) => {
+      if (!closed) send(stage);
+    });
+    if (!closed) {
+      send({ stage: "done", ...result });
+      res.end();
+    }
+  } catch (err) {
+    console.error("Query stream error:", err);
+    if (!closed) {
+      send({ stage: "error", error: err.message || "Query failed" });
+      res.end();
+    }
   }
 });
 
