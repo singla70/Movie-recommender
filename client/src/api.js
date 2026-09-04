@@ -2,7 +2,14 @@
 // src/api.js — thin fetch wrapper for the Express API (server/index.js)
 // ============================================================
 
-const BASE = "/api";
+// BASE resolves to the deployed backend's absolute URL (VITE_API_URL,
+// set in Vercel's Environment Variables) in production, and falls back
+// to the relative "/api" — which vite.config.js proxies to localhost:4000
+// — only for local `npm run client:dev`. Without VITE_API_URL set,
+// production requests would hit Vercel's own domain instead of Render,
+// and (now that vercel.json has a SPA catch-all rewrite) get back
+// index.html instead of JSON.
+const BASE = import.meta.env.VITE_API_URL || "/api";
 
 async function request(path, options = {}) {
   const res = await fetch(`${BASE}${path}`, {
