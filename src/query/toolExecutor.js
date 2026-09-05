@@ -16,6 +16,7 @@ import {
   searchByDirectorAndAward,
   searchActorsByGenre,
   searchByActorAndGenre,
+  searchByActorAndDirector,
   searchByLanguage,
   searchByCountry,
   searchCoactors,
@@ -62,6 +63,9 @@ export async function executeTool(toolName, params = {}) {
 
     case "search_by_actor_and_genre":
       return searchByActorAndGenre(params.actors || [], params.genres || [], topK);
+
+    case "search_by_actor_and_director":
+      return searchByActorAndDirector(params.actors || [], params.directors || [], topK);
 
     case "search_by_language":
       return searchByLanguage(params.languages || [], topK);

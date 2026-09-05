@@ -22,6 +22,7 @@ import { vectorSearch, getVectorCandidates } from "./vectorSearch.js";
 import { graphSearch, graphEnrichAndFilter } from "./graphSearch.js";
 import { executeDecomposedQuery } from "./queryDecomposer.js";
 import { executeToolsParallel } from "./toolExecutor.js";
+import { generateAndRunCypher } from "./text2cypher.js";
 import { buildResponse, buildMultiQueryResponse } from "./responseBuilder.js";
 import { chatCompletion } from "../utils/openrouterClient.js";
 import { MODELS } from "../config/constants.js";
@@ -60,7 +61,14 @@ async function executeSingleQuery(queryInfo, conversationHistory) {
     return await vectorSearch(query_text, topK, vectorFilter || {});
   }
   if (effectiveRoute === "graph") {
-    return await graphSearch(entitiesWithQuery, topK);
+    const gResults = await graphSearch(entitiesWithQuery, topK);
+    if (gResults.length > 0) return gResults;
+    // Nothing so far — decomposer, direct LLM tool-picks, and the
+    // fixed entitiesToTools() menu all came up empty. Rather than
+    // hand-writing yet another combo-tool (queries are combinatorially
+    // infinite — see text2cypher.js header), let the LLM write the
+    // actual Cypher for whatever this specific combination needs.
+    return await generateAndRunCypher(query_text, topK);
   }
 
   const candidates = await getVectorCandidates(query_text, vectorFilter || {});
@@ -68,7 +76,10 @@ async function executeSingleQuery(queryInfo, conversationHistory) {
   if (enriched.length > 0) return enriched;
 
   const gResults = await graphSearch(entitiesWithQuery, topK);
-  return [...candidates.slice(0, topK), ...gResults];
+  if (gResults.length > 0) return [...candidates.slice(0, topK), ...gResults];
+
+  const cypherResults = await generateAndRunCypher(query_text, topK);
+  return [...candidates.slice(0, topK), ...cypherResults];
 }
 
 // ── Public entry point ─────────────────────────────────────────

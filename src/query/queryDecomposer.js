@@ -81,6 +81,7 @@ Available tools:
 - search_by_director_and_award(directors[])
 - search_coactors(actor)
 - search_common_movies(actor1, actor2)
+- search_by_actor_and_director(actors[], directors[])
 - search_franchise_movies(keyword)
 - search_top_rated(limit, filters)
 

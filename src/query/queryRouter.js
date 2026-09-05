@@ -37,6 +37,7 @@ AVAILABLE TOOLS (use exact tool names):
 20. search_by_rating_range(minRating: number, maxRating: number, filters?: {genre?, language?})
 21. search_franchise_movies(keyword: string)
 22. search_director_filmography(director: string)
+23. search_by_actor_and_director(actors: string[], directors: string[]) — use when the query asks for movies where a SPECIFIC actor AND a SPECIFIC director both worked together (NOT two separate tool calls — this one guarantees the same movie)
 `;
 
 export async function routeQuery(userQuery, conversationHistory = [], onRetry) {
@@ -57,7 +58,16 @@ in one message, split into separate queries. Each query gets its own tool calls.
 Example: "Nolan ki movies aur Gippy Grewal ki comedy movies" → 2 separate queries.
 
 RULE 3 — Tool selection: Choose the most specific tools for each query.
-Multiple tools can be called — they run in parallel.
+Multiple tools can be called — they run in parallel and results are merged
+(a UNION, not an intersection). So when the question needs a SINGLE movie
+to satisfy MULTIPLE conditions together (e.g. "movies where both X and Y
+worked together", "X's movie that also won an award") — pick the ONE
+combined tool for that exact combination if one exists (e.g.
+search_by_actor_and_director, search_by_actor_and_genre,
+search_by_director_and_award) rather than calling two separate single-
+entity tools, since separate tools would each return that person's ENTIRE
+filmography and merging them answers a different, broader question than
+what was asked.
 
 RULE 4 — Followup context: Use conversation history to carry forward entities.
 

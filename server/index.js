@@ -48,6 +48,19 @@ fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const app = express();
 
+// ── Trust the reverse proxy Render/Vercel/etc sit behind ────────
+// CRITICAL: without this, express-rate-limit (v7+) throws
+// ERR_ERL_UNEXPECTED_X_FORWARDED_FOR and CRASHES THE PROCESS on the
+// very first request to any rate-limited route — Render (like any
+// PaaS behind a load balancer) sets X-Forwarded-For on every request,
+// and Express's own 'trust proxy' defaults to false, which
+// express-rate-limit treats as a misconfiguration serious enough to
+// refuse to run rather than silently rate-limit by the wrong IP.
+// `1` = trust exactly one hop (Render's own edge) — correct for a
+// single-proxy deployment; trusting more hops than actually exist
+// would let a client spoof X-Forwarded-For to bypass rate limits.
+app.set("trust proxy", 1);
+
 // ── CORS ────────────────────────────────────────────────────
 // Open by default (backward-compatible — no env var required to keep
 // working exactly as before). Set ALLOWED_ORIGINS (comma-separated,

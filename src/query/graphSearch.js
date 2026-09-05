@@ -14,7 +14,8 @@
 //             searchByYearRange, searchTopRated, searchCommonMovies,
 //             searchActorAggregates, searchDirectorAggregates,
 //             searchGenreOscarStats, searchByRatingRange,
-//             searchFranchiseMovies, searchDirectorFilmography
+//             searchFranchiseMovies, searchDirectorFilmography,
+//             searchByActorAndDirector (true actor+director intersection)
 // ============================================================
 
 import { runQuery } from "../utils/neo4jClient.js";
@@ -49,13 +50,21 @@ function entitiesToTools(entities, topK) {
   const hasLanguage = entities.language?.length > 0;
   const hasCountry  = entities.country?.length > 0;
 
-  if (hasDirector && hasAward) {
+  if (hasDirector && hasActor) {
+    // BUG FIX: pehle ye do alag branches thi (director wala tool +
+    // actor wala tool), jo har ek ki POORI filmography laake sirf
+    // UNION/merge karti thi — "dono ne saath kaam kiya" jaisa query
+    // galat tarah se "isme se koi bhi ek" ban jaata tha. Ab ek hi
+    // combined tool use hota hai jo Cypher mein hi dono ko SAME movie
+    // se guarantee karta hai (true intersection) — jaisa niche
+    // hasActor+hasGenre wale case mein already tha, sirf director ke
+    // liye missing tha.
+    tools.push({ name: "search_by_actor_and_director", params: { actors: entities.actors, directors: entities.directors, limit: topK } });
+  } else if (hasDirector && hasAward) {
     tools.push({ name: "search_by_director_and_award", params: { directors: entities.directors, limit: topK } });
   } else if (hasDirector) {
     tools.push({ name: "search_by_director", params: { directors: entities.directors, limit: topK } });
-  }
-
-  if (hasActor && hasGenre) {
+  } else if (hasActor && hasGenre) {
     // Pehle dono tools chalte the (search_by_actor_and_genre +
     // search_actor_in_multiple_genres) — overlapping results dete hain,
     // deduplicateByTitle se merge ho jaate the, lekin ek extra Neo4j
@@ -328,6 +337,40 @@ export async function searchByActorAndGenre(actors, genres, limit = 10) {
     ORDER BY m.year DESC LIMIT $limit
   `;
   return (await runQuery(cypher, { actors, genres, limit: parseInt(limit) })).map(formatResult);
+}
+
+// ── "Movies where BOTH this actor AND this director worked together" ──
+// BUG FIX (found via live testing): entitiesToTools() pehle actor aur
+// director ko SEPARATE tools mein bhejta tha (search_by_actor +
+// search_by_director) — ye do INDEPENDENT filmography-lists laate
+// hain (Nolan ki SAARI movies + Leonardo ki SAARI movies), jo
+// deduplicateByTitle() se sirf UNION (merge) hoti hain, INTERSECTION
+// nahi. Matlab "Leonardo aur Nolan ne saath mein kaunsi movie ki"
+// jaisa query har Nolan movie (Oppenheimer, Interstellar, Dark
+// Knight — Leonardo inmein nahi tha) aur har Leonardo movie (Wolf of
+// Wall Street, Gatsby, Departed, Titanic — Nolan inke director nahi
+// the) ko bhi ANSWER mein daal deta tha, sabko wahi flat 1-hop
+// (~100%) confidence ke saath — sirf Inception (jo asal mein sahi
+// jawab tha) in sab false-positives ke saath dab jaata tha.
+// Ye function ek hi Cypher MATCH chain se dono ko SAME movie node se
+// guarantee karta hai — true intersection, koi union-then-merge nahi.
+export async function searchByActorAndDirector(actors, directors, limit = 10) {
+  const cypher = `
+    UNWIND $actors AS actorName
+    MATCH (a:Actor) WHERE toLower(a.name) CONTAINS toLower(actorName)
+    UNWIND $directors AS dirName
+    MATCH (d:Director) WHERE toLower(d.name) CONTAINS toLower(dirName)
+    MATCH (a)-[:ACTED_IN]->(m:Movie)-[:DIRECTED_BY]->(d)
+    OPTIONAL MATCH (allActor:Actor)-[:ACTED_IN]->(m)
+    WITH m, d, a, collect(DISTINCT allActor.name)[0..5] AS actors
+    RETURN m.id AS movieId, m.title AS title, m.year AS year,
+           m.rating AS rating, m.oscarWon AS oscarWon,
+           m.oscarNominations AS oscarNominations, m.plot AS plot,
+           d.name AS director, actors,
+           1 AS hops, a.name + ' + ' + d.name + ' (same movie)' AS matchReason
+    ORDER BY m.year DESC LIMIT $limit
+  `;
+  return (await runQuery(cypher, { actors, directors, limit: parseInt(limit) })).map(formatResult);
 }
 
 export async function searchByLanguage(languages, limit = 10) {
