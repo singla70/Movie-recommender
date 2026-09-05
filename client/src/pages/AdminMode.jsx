@@ -196,27 +196,47 @@ function ManageMovies({ connected, onChanged }) {
   const [mode, setMode] = useState(null); // null | 'add' | 'edit'
   const [resetKey, setResetKey] = useState(0);
   const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [results, setResults] = useState([]);
   const [searching, setSearching] = useState(false);
   const [selected, setSelected] = useState(null);
   const [busy, setBusy] = useState(false);
   const [log, setLog] = useState([]);
   const [notice, setNotice] = useState(null); // { type: 'success'|'error', text }
+  const searchSeqRef = useRef(0); // guards against out-of-order responses (see effect below)
 
-  async function runSearch(q) {
-    setSearch(q);
-    setSelected(null);
-    if (!q.trim()) return setResults([]);
-    setSearching(true);
-    try {
-      const { movies } = await api.listMovies(q);
-      setResults(movies);
-    } catch {
+  // Debounce — wait for typing to pause before firing a request at all.
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(search), 300);
+    return () => clearTimeout(t);
+  }, [search]);
+
+  // Fire the actual search only on the debounced value — and tag each
+  // request with a sequence number so a SLOWER, OLDER request that
+  // happens to resolve AFTER a newer one can never overwrite the
+  // newer one's (correct) results. Without this, typing fast could
+  // show stale/wrong results depending purely on network timing —
+  // not which request was actually the last one fired.
+  useEffect(() => {
+    if (!debouncedSearch.trim()) {
       setResults([]);
-    } finally {
       setSearching(false);
+      return;
     }
-  }
+    const seq = ++searchSeqRef.current;
+    setSearching(true);
+    api
+      .listMovies(debouncedSearch)
+      .then(({ movies }) => {
+        if (seq === searchSeqRef.current) setResults(movies);
+      })
+      .catch(() => {
+        if (seq === searchSeqRef.current) setResults([]);
+      })
+      .finally(() => {
+        if (seq === searchSeqRef.current) setSearching(false);
+      });
+  }, [debouncedSearch]);
 
   async function pickMovie(id) {
     setBusy(true);
@@ -285,6 +305,7 @@ function ManageMovies({ connected, onChanged }) {
     setMode(null);
     setSelected(null);
     setSearch("");
+    setDebouncedSearch("");
     setResults([]);
     setLog([]);
     setNotice(null);
@@ -352,7 +373,7 @@ function ManageMovies({ connected, onChanged }) {
               <input
                 autoFocus
                 value={search}
-                onChange={(e) => runSearch(e.target.value)}
+                onChange={(e) => { setSearch(e.target.value); setSelected(null); }}
                 placeholder="Search by title…"
                 className="w-full rounded-md border border-theatre-border bg-theatre-bg px-3 py-2 text-sm text-theatre-text placeholder:text-theatre-faint focus:border-teal/50"
               />
