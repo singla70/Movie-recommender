@@ -97,12 +97,27 @@ const uploadLimiter = rateLimit({
 // (one embedding call, not a whole batch pipeline) but still touches
 // the shared LLM/embedding quota, so it gets its own bound rather
 // than sharing uploadLimiter's tighter budget.
-const adminLimiter = rateLimit({
+const adminWriteLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: Number(process.env.ADMIN_RATE_LIMIT_PER_MIN) || 20,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many admin operations from this address — please wait a moment and try again." },
+});
+// Movie search/list is a plain read-only Neo4j query — no LLM or
+// embedding call at all, so it doesn't share the shared-quota concern
+// the write limiter above exists for. A generous limit here mainly
+// just guards against runaway request loops, not normal typing —
+// the search box debounces (300ms) before firing, but if someone
+// types with unusually long pauses between letters, each pause could
+// still fire its own request; this budget comfortably absorbs that
+// without ever getting in the way of legitimate use.
+const movieSearchLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.MOVIE_SEARCH_RATE_LIMIT_PER_MIN) || 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many searches from this address — please wait a moment and try again." },
 });
 
 const upload = multer({
@@ -272,7 +287,7 @@ app.post("/api/upload/retry/:jobId", (req, res) => {
 // seconds. These are synchronous (no job-polling needed) since a
 // single movie is fast — typically one embedding call + two DB writes.
 
-app.get("/api/movies", adminLimiter, async (req, res) => {
+app.get("/api/movies", movieSearchLimiter, async (req, res) => {
   try {
     const movies = await listMovies(req.query.search || "", Number(req.query.limit) || 30);
     res.json({ movies });
@@ -281,7 +296,7 @@ app.get("/api/movies", adminLimiter, async (req, res) => {
   }
 });
 
-app.get("/api/movies/:id", adminLimiter, async (req, res) => {
+app.get("/api/movies/:id", movieSearchLimiter, async (req, res) => {
   try {
     const movie = await getMovieById(req.params.id);
     if (!movie) return res.status(404).json({ error: "Movie not found" });
@@ -291,7 +306,7 @@ app.get("/api/movies/:id", adminLimiter, async (req, res) => {
   }
 });
 
-app.post("/api/movies", adminLimiter, async (req, res) => {
+app.post("/api/movies", adminWriteLimiter, async (req, res) => {
   const log = [];
   try {
     const movie = await upsertMovie(req.body, null, (line) => log.push(line));
@@ -301,7 +316,7 @@ app.post("/api/movies", adminLimiter, async (req, res) => {
   }
 });
 
-app.put("/api/movies/:id", adminLimiter, async (req, res) => {
+app.put("/api/movies/:id", adminWriteLimiter, async (req, res) => {
   const log = [];
   try {
     const existing = await getMovieById(req.params.id);
@@ -313,7 +328,7 @@ app.put("/api/movies/:id", adminLimiter, async (req, res) => {
   }
 });
 
-app.delete("/api/movies/:id", adminLimiter, async (req, res) => {
+app.delete("/api/movies/:id", adminWriteLimiter, async (req, res) => {
   const log = [];
   try {
     const result = await deleteMovie(req.params.id, (line) => log.push(line));
