@@ -1,12 +1,23 @@
 // ============================================================
 // server/ingestJob.js
 //
-// scripts/ingest.js jaisa hi pipeline hai (parse → embed → reconcile
+// scripts/ingest.js jaisa hi pipeline hai (parse → reconcile → embed
 // → load), bas console.log ki jagah in-memory job-state track karta
 // hai — taaki Admin UI polling se progress dikha sake. Jobs process
 // memory mein rakhe jaate hain (Map) — ek single-server-instance
 // deployment ke liye theek hai; production-scale ke liye Redis/DB
 // backed job-queue chahiye hoga (yahan scope se bahar).
+//
+// PIPELINE ORDER — RECONCILE BEFORE EMBED (naya): pehle version
+// parse → embed (SABKE liye, chahe already DB mein ho) → reconcile
+// tha — matlab already-existing movies ke liye bhi embedding API
+// calls waste hoti thi. Ab reconcile pehle chalta hai (sirf ek Neo4j
+// read, sasta), aur embedding SIRF genuinely-new movies ke liye
+// generate hoti hai. Already-existing movies ko is bulk-upload path
+// se bilkul touch nahi kiya jaata — unhe update karna ho toh admin
+// ke naya single-movie edit feature (src/ingestion/movieCrud.js,
+// server/index.js ke /api/movies/:id routes) se hota hai, jahan
+// admin explicitly decide karta hai kya badalna hai.
 //
 // RESUMABLE INGESTION — scripts/ingest.js ka CACHE_FILE pattern yahan
 // bhi laaya gaya hai (pehle sirf CLI script mein tha, Admin-UI path
@@ -14,17 +25,20 @@
 // (LLM calls) aur embedding (embedding-API calls) — dono expensive
 // steps — har ek complete hote hi disk pe cache ho jaate hain. Agar
 // koi baad ka step fail ho (rate limit, DB down, whatever), retry
-// (same PDF) seedha jahan se rukha wahin se resume karta hai — parse/
-// embed dobara nahi hota, koi LLM/embedding cost dobara waste nahi
-// hoti. Success pe cache delete ho jaata hai.
+// (same PDF) seedha jahan se rukha wahin se resume karta hai. Success
+// pe cache delete ho jaata hai.
 //
-// DUPLICATE MOVIES — agar upload ki gayi PDF mein koi movie already
-// DB mein hai (same title+year), pehle woh naya Movie node/vector ban
-// jaata (fresh positional ID = fresh MERGE = duplicate). Ab load se
-// pehle reconcileMovieIds() (src/ingestion/idReconciler.js — pehle
-// sirf scripts/migrate.js use karta tha, is live path mein kabhi wire
-// nahi hua tha) existing DB se title+year match karke purana ID reuse
-// karta hai — duplicate ki jagah UPDATE hota hai.
+// FULL LOG VISIBILITY (naya) — pdfParser.js/embedder.js/
+// pineconeLoader.js/neo4jLoader.js/idReconciler.js sab already
+// console.log/warn/error se rich batch-level progress print karte
+// hain ("batch 3/7", "upserting...", etc) — pehle ye sirf Render ke
+// server logs mein jaate the, Admin UI ko sirf humare manual
+// milestone-summaries dikhte the. Ab is job ke chalte waqt console.*
+// ko temporarily wrap kiya jaata hai taaki HAR line job ke apne log
+// mein bhi capture ho (aur asli console pe bhi print hoti rahe —
+// Render ke logs silent nahi hote). Assumption: ek waqt mein sirf EK
+// ingestion job chalti hai (single-admin portfolio app ke liye
+// realistic) — concurrent jobs hui toh unke logs mix ho sakte hain.
 // ============================================================
 
 import fs from "fs";
@@ -56,11 +70,31 @@ function appendLog(jobId, line) {
   const job = jobs.get(jobId);
   if (!job) return;
   job.log.push(line);
-  if (job.log.length > 200) job.log.shift(); // cap — UI sirf recent lines dikhata hai
+  if (job.log.length > 500) job.log.shift(); // cap — UI ek badi list ke liye scroll kar sakta hai
 }
 
 export function getJob(jobId) {
   return jobs.get(jobId) || null;
+}
+
+// ── Console.* ko temporarily capture karo isi job ke log mein ──
+async function withCapturedConsole(jobId, fn) {
+  const original = { log: console.log, warn: console.warn, error: console.error };
+  const capture = (prefix) => (...args) => {
+    const line = args.map((a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" ").trim();
+    if (line) appendLog(jobId, line);
+    original[prefix](...args); // Render ke apne logs bhi chalte rahen
+  };
+  console.log = capture("log");
+  console.warn = capture("warn");
+  console.error = capture("error");
+  try {
+    return await fn();
+  } finally {
+    console.log = original.log;
+    console.warn = original.warn;
+    console.error = original.error;
+  }
 }
 
 // ── Resumability cache — keyed by PDF content hash ─────────────
@@ -102,83 +136,104 @@ export function runIngestJob(jobId, pdfPath) {
   newJob(jobId, pdfPath);
   // Fire-and-forget — caller turant jobId return karta hai, ye
   // background mein chalti hai, UI poll karta hai getJob() se.
-  (async () => {
-    let hash = null;
-    try {
-      hash = await hashFile(pdfPath);
-      const cache = readCache(hash);
-
-      let movies, embeddings, failedBatches;
-
-      if (cache?.embeddings) {
-        // Parse AND embed already done in a previous attempt — skip both.
-        movies = cache.movies;
-        embeddings = cache.embeddings;
-        failedBatches = cache.failedBatches || [];
-        updateJob(jobId, { stage: "embedding" });
-        appendLog(jobId, `Resuming from a previous attempt — ${movies.length} movies were already parsed and embedded. Skipping straight to the database write.`);
-      } else if (cache?.movies) {
-        // Parse done, embedding wasn't — skip parse only.
-        movies = cache.movies;
-        appendLog(jobId, `Resuming from a previous attempt — ${movies.length} movies were already parsed. Skipping PDF parsing.`);
-
-        updateJob(jobId, { stage: "embedding" });
-        appendLog(jobId, "Generating embeddings...");
-        const embedResult = await generateMovieEmbeddings(movies);
-        embeddings = embedResult.embeddings;
-        failedBatches = embedResult.failedBatches;
-        writeCache(hash, { movies, embeddings, failedBatches });
-        appendLog(jobId, `Generated ${embeddings.length}/${movies.length} embeddings.`);
-      } else {
-        // Fresh run — nothing cached yet.
-        updateJob(jobId, { stage: "parsing" });
-        appendLog(jobId, `Reading ${path.basename(pdfPath)}...`);
-        movies = await parsePDFToMovies(pdfPath);
-        appendLog(jobId, `Parsed ${movies.length} movies.`);
-        writeCache(hash, { movies });
-
-        updateJob(jobId, { stage: "embedding" });
-        appendLog(jobId, "Generating embeddings...");
-        const embedResult = await generateMovieEmbeddings(movies);
-        embeddings = embedResult.embeddings;
-        failedBatches = embedResult.failedBatches;
-        writeCache(hash, { movies, embeddings, failedBatches });
-        appendLog(jobId, `Generated ${embeddings.length}/${movies.length} embeddings.`);
-      }
-
-      if (failedBatches?.length > 0) {
-        appendLog(jobId, `${failedBatches.length} embedding batch(es) failed — those movies may be missing from semantic search.`);
-      }
-
-      updateJob(jobId, { stage: "loading" });
-      appendLog(jobId, "Checking for movies that already exist in the database...");
-      const { movies: reconciled, matched, newMovies } = await reconcileMovieIds(movies);
-      appendLog(jobId, `${matched} movie(s) already existed — will update, not duplicate. ${newMovies} new movie(s) will be added.`);
-
-      appendLog(jobId, "Writing to Pinecone + Neo4j...");
-      const [pineconeCount, neo4jCount] = await Promise.all([
-        loadMoviesToPinecone(reconciled, embeddings),
-        loadMoviesToNeo4j(reconciled),
-      ]);
-      appendLog(jobId, `Pinecone: ${pineconeCount} vectors. Neo4j: ${neo4jCount} movies.`);
-
-      updateJob(jobId, {
-        stage: "done",
-        result: { movies: movies.length, matched, newMovies, pineconeCount, neo4jCount },
-      });
-      appendLog(jobId, "Ingestion complete.");
-
-      clearCache(hash); // success — nothing left to resume, safe to drop
-    } catch (err) {
-      updateJob(jobId, { stage: "error", error: err.message });
-      appendLog(jobId, `Failed: ${err.message}`);
-      if (hash) {
-        appendLog(jobId, "Progress so far is cached — hit Retry and it'll resume instead of starting over.");
-      }
-    }
-  })();
-
+  withCapturedConsole(jobId, () => runPipeline(jobId, pdfPath)).catch((err) => {
+    // withCapturedConsole ke bahar ka fallback — agar console-wrap
+    // khud hi kabhi throw kare (nahi hona chahiye, safety net hai)
+    updateJob(jobId, { stage: "error", error: err.message });
+  });
   return jobId;
+}
+
+async function runPipeline(jobId, pdfPath) {
+  let hash = null;
+  try {
+    hash = await hashFile(pdfPath);
+    const cache = readCache(hash);
+
+    let parsedMovies, embeddings, failedBatches;
+
+    if (cache?.parsedMovies) {
+      parsedMovies = cache.parsedMovies;
+      appendLog(jobId, `Resuming from a previous attempt — ${parsedMovies.length} movies were already parsed. Skipping PDF parsing.`);
+    } else {
+      updateJob(jobId, { stage: "parsing" });
+      appendLog(jobId, `Reading ${path.basename(pdfPath)}...`);
+      parsedMovies = await parsePDFToMovies(pdfPath);
+      appendLog(jobId, `Parsed ${parsedMovies.length} movies.`);
+      writeCache(hash, { parsedMovies });
+    }
+
+    // Reconcile BEFORE embedding — sirf genuinely-new movies ke liye
+    // embedding API calls lagengi. Already-existing movies is path se
+    // bilkul touch nahi hote (unhe badalna ho toh admin ke single-
+    // movie edit feature se hota hai).
+    updateJob(jobId, { stage: "reconciling" });
+    appendLog(jobId, "Checking which movies already exist in the database...");
+    const { newMovieList, matched } = await reconcileMovieIds(parsedMovies);
+    appendLog(jobId, `${matched} movie(s) already exist — skipped (no re-embedding, no re-write). ${newMovieList.length} new movie(s) to add.`);
+
+    if (newMovieList.length === 0) {
+      updateJob(jobId, { stage: "done", result: { total: parsedMovies.length, matched, added: 0, pineconeCount: 0, neo4jCount: 0 } });
+      appendLog(jobId, "Nothing new to add — every movie in this PDF is already in the database.");
+      clearCache(hash);
+      return;
+    }
+
+    if (cache?.embeddings) {
+      embeddings = cache.embeddings;
+      failedBatches = cache.failedBatches || [];
+      appendLog(jobId, `Resuming — embeddings for the new movies were already generated in a previous attempt.`);
+    } else {
+      updateJob(jobId, { stage: "embedding" });
+      appendLog(jobId, `Generating embeddings for ${newMovieList.length} new movie(s)...`);
+      const embedResult = await generateMovieEmbeddings(newMovieList);
+      embeddings = embedResult.embeddings;
+      failedBatches = embedResult.failedBatches;
+      writeCache(hash, { parsedMovies, embeddings, failedBatches });
+      appendLog(jobId, `Generated ${embeddings.length}/${newMovieList.length} embeddings.`);
+    }
+
+    if (failedBatches?.length > 0) {
+      appendLog(jobId, `${failedBatches.length} embedding batch(es) failed — those movies won't be searchable yet: ${failedBatches.flatMap((b) => b.movieIds).join(", ")}`);
+    }
+
+    // Embed ho chuki movies hi load karo — agar koi batch permanently
+    // fail hui (failedBatches), uska embedding nahi bana, isliye use
+    // load bhi nahi karna (loadMoviesToPinecone khud bhi ismein
+    // movieId-not-found pe warn karke skip kar deta, ye extra check
+    // sirf load-step ko sirf-relevant movies tak seedha limit karta hai).
+    const embeddedIds = new Set(embeddings.map((e) => e.movieId));
+    const moviesToLoad = newMovieList.filter((m) => embeddedIds.has(m.id));
+
+    updateJob(jobId, { stage: "loading" });
+    appendLog(jobId, `Writing ${moviesToLoad.length} movie(s) to Pinecone + Neo4j...`);
+    const [pineconeCount, neo4jCount] = await Promise.all([
+      loadMoviesToPinecone(moviesToLoad, embeddings),
+      loadMoviesToNeo4j(moviesToLoad),
+    ]);
+    appendLog(jobId, `Pinecone: ${pineconeCount} vectors. Neo4j: ${neo4jCount} movies.`);
+
+    updateJob(jobId, {
+      stage: "done",
+      result: {
+        total: parsedMovies.length,
+        matched,
+        added: pineconeCount,
+        pineconeCount,
+        neo4jCount,
+        failedMovies: failedBatches?.flatMap((b) => b.movieIds) || [],
+      },
+    });
+    appendLog(jobId, "Ingestion complete.");
+
+    clearCache(hash); // success — nothing left to resume, safe to drop
+  } catch (err) {
+    updateJob(jobId, { stage: "error", error: err.message });
+    appendLog(jobId, `Failed: ${err.message}`);
+    if (hash) {
+      appendLog(jobId, "Progress so far is cached — hit Retry and it'll resume instead of starting over.");
+    }
+  }
 }
 
 // ── Retry a failed job — reuses the same uploaded PDF, so the hash-

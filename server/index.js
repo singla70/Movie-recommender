@@ -8,9 +8,16 @@
 //
 // Endpoints:
 //   POST /api/query              — { query_text, conversation_history } → { answer, movies, route }
+//   POST /api/query/stream       — same, but Server-Sent Events with real pipeline-stage progress
 //   GET  /api/stats              — Neo4j graph stats (movies/actors/directors/genres)
 //   POST /api/upload             — multipart PDF → kicks off async ingestion job → { jobId }
 //   GET  /api/upload/status/:id  — poll job progress → { stage, log, result? }
+//   POST /api/upload/retry/:id   — retry a failed job on the same PDF (resumes via disk cache)
+//   GET  /api/movies             — list/search movies (?search=&limit=)
+//   GET  /api/movies/:id         — get one movie's full detail
+//   POST /api/movies             — add a new movie
+//   PUT  /api/movies/:id         — update an existing movie
+//   DELETE /api/movies/:id       — delete a movie (Neo4j + Pinecone both)
 //   GET  /api/connections        — quick health-check (Neo4j reachable?)
 //
 // Conversation history STATELESS hai server-side — frontend har
@@ -33,6 +40,7 @@ import { processQuery } from "../src/query/queryEngine.js";
 import { getNeo4jStats } from "../src/ingestion/neo4jLoader.js";
 import { getNeo4jDriver, closeNeo4jDriver } from "../src/utils/neo4jClient.js";
 import { runIngestJob, getJob, retryJob } from "./ingestJob.js";
+import { upsertMovie, deleteMovie, getMovieById, listMovies } from "../src/ingestion/movieCrud.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOAD_DIR = path.join(__dirname, "uploads");
@@ -84,6 +92,17 @@ const uploadLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many uploads from this address — please wait a few minutes and try again." },
+});
+// Single-movie add/edit/delete — lighter-weight than a PDF upload
+// (one embedding call, not a whole batch pipeline) but still touches
+// the shared LLM/embedding quota, so it gets its own bound rather
+// than sharing uploadLimiter's tighter budget.
+const adminLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.ADMIN_RATE_LIMIT_PER_MIN) || 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many admin operations from this address — please wait a moment and try again." },
 });
 
 const upload = multer({
@@ -243,6 +262,65 @@ app.post("/api/upload/retry/:jobId", (req, res) => {
     return res.status(404).json({ error: "Original upload not found — its file may have been cleaned up. Upload the PDF again." });
   }
   res.json({ jobId: newJobId });
+});
+
+// ── Movie CRUD — admin's "manage individual movies" feature ────
+// Each route captures its own step-by-step log (embedding, then
+// Neo4j, then Pinecone) in the response, same reasoning as the PDF-
+// ingestion job's log capture: the admin should see what's actually
+// happening rather than the request just going quiet for a few
+// seconds. These are synchronous (no job-polling needed) since a
+// single movie is fast — typically one embedding call + two DB writes.
+
+app.get("/api/movies", adminLimiter, async (req, res) => {
+  try {
+    const movies = await listMovies(req.query.search || "", Number(req.query.limit) || 30);
+    res.json({ movies });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/movies/:id", adminLimiter, async (req, res) => {
+  try {
+    const movie = await getMovieById(req.params.id);
+    if (!movie) return res.status(404).json({ error: "Movie not found" });
+    res.json(movie);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/movies", adminLimiter, async (req, res) => {
+  const log = [];
+  try {
+    const movie = await upsertMovie(req.body, null, (line) => log.push(line));
+    res.json({ movie, log });
+  } catch (err) {
+    res.status(500).json({ error: err.message, log });
+  }
+});
+
+app.put("/api/movies/:id", adminLimiter, async (req, res) => {
+  const log = [];
+  try {
+    const existing = await getMovieById(req.params.id);
+    if (!existing) return res.status(404).json({ error: "Movie not found", log });
+    const movie = await upsertMovie(req.body, req.params.id, (line) => log.push(line));
+    res.json({ movie, log });
+  } catch (err) {
+    res.status(500).json({ error: err.message, log });
+  }
+});
+
+app.delete("/api/movies/:id", adminLimiter, async (req, res) => {
+  const log = [];
+  try {
+    const result = await deleteMovie(req.params.id, (line) => log.push(line));
+    res.json({ ...result, log });
+  } catch (err) {
+    res.status(err.message === "Movie not found." ? 404 : 500).json({ error: err.message, log });
+  }
 });
 
 // ── Error handler (multer file-type/size errors etc) ─────────

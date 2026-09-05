@@ -40,14 +40,19 @@ async function buildExistingMovieIndex() {
 
 // ── Fresh-parsed movies ke IDs reconcile karo ─────────────────
 // movies: freshly-parsed movie objects (naye positional IDs ke saath)
-// returns: same movies array, id field reconciled where a match was found
-//          + stats { matched, newMovies }
+// returns: { movies (full array, ids reconciled — back-compat for
+//   scripts/migrate.js), matched, newMovies (counts — same back-compat),
+//   newMovieList, existingMovieList (NEW — actual arrays, so callers
+//   that only care about genuinely-new movies, like server/ingestJob.js,
+//   don't have to re-filter movies[] themselves) }
 export async function reconcileMovieIds(movies) {
   console.log("  🔗 Matching freshly-parsed movies against existing Neo4j data (by title+year)...");
   const existingIndex = await buildExistingMovieIndex();
 
   let matched = 0;
   let newMovies = 0;
+  const newMovieList = [];
+  const existingMovieList = [];
 
   const reconciled = movies.map((movie) => {
     const key = `${(movie.title || "").toLowerCase().trim()}|${movie.year ?? "null"}`;
@@ -55,15 +60,18 @@ export async function reconcileMovieIds(movies) {
 
     if (existingId) {
       matched++;
-      return { ...movie, id: existingId }; // reuse existing id — UPDATE, not duplicate
+      const m = { ...movie, id: existingId }; // reuse existing id — UPDATE, not duplicate
+      existingMovieList.push(m);
+      return m;
     } else {
       newMovies++;
-      return movie; // naya movie — fresh id hi rehne do (nayi entry banegi)
+      newMovieList.push(movie); // naya movie — fresh id hi rehne do (nayi entry banegi)
+      return movie;
     }
   });
 
   console.log(
     `  ✅ ${matched} movies matched to existing records (will UPDATE), ${newMovies} new movies (will INSERT)`
   );
-  return { movies: reconciled, matched, newMovies };
+  return { movies: reconciled, matched, newMovies, newMovieList, existingMovieList };
 }

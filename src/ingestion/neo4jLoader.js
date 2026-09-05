@@ -68,7 +68,8 @@ export async function loadMoviesToNeo4j(movies) {
         return { ok: true, count: batch.length };
       } catch (err) {
         console.error(`  ❌ Neo4j batch ${i + 1}/${batches.length} failed: ${err.message.substring(0, 100)}`);
-        return { ok: false, count: batch.length, error: err.message };
+        console.error(`     Affected movies: ${batch.map((m) => `${m.title || "Unknown"} (${m.id})`).join(", ")}`);
+        return { ok: false, count: batch.length, error: err.message, movieIds: batch.map((m) => m.id) };
       }
     }
   );

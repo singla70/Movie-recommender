@@ -14,10 +14,11 @@ This repo now has three runnable pieces:
 movie-graph-rag/
 ├── app.js              ← original CLI chatbot (unchanged, still works: `npm start`)
 ├── src/                ← core RAG logic (query + ingestion), shared by app.js AND the API
-│   └── query/queryEngine.js   ← stateless wrapper around app.js's query logic, used by server/
+│   ├── query/queryEngine.js   ← stateless wrapper around app.js's query logic, used by server/
+│   └── ingestion/movieCrud.js ← single-movie add/update/delete, keeps Neo4j + Pinecone consistent (see §0.6)
 ├── server/              ← Express API (bridge for the React frontend)
 │   ├── index.js          ← routes: /api/query, /api/query/stream (SSE), /api/stats, /api/upload,
-│   │                        /api/upload/status/:id, /api/upload/retry/:id, /api/connections
+│   │                        /api/upload/status/:id, /api/upload/retry/:id, /api/movies (CRUD, see §0.6), /api/connections
 │   └── ingestJob.js       ← background PDF-ingestion job runner (polled by the Admin UI) — resumable, see §7
 └── client/               ← React + Vite + Tailwind frontend ("Cinegraph")
     └── src/
@@ -140,6 +141,71 @@ portfolio scale, not fine indefinitely.
 - **Movie cards** — click to expand: full cast list, all genres, Oscar-nomination count, match-confidence — fields `responseBuilder.js` already sends but the collapsed row had no room for. Nothing invented; the (already-truncated) plot isn't any longer than what the collapsed view showed.
 - **`client/vercel.json`** — added a SPA catch-all rewrite (`/(.*) → /index.html`). Without it, refreshing `/query` or `/admin` directly hit Vercel's static host looking for a literal file at that path and 404'd — React Router only ever sees a route after `index.html` loads and its JS runs.
 - **`VITE_API_URL`** — `client/src/api.js`'s `BASE` reads `import.meta.env.VITE_API_URL`, falling back to the relative `/api` (which `vite.config.js`'s dev-server proxy forwards to `localhost:4000`) only for local `npm run client:dev`. Must be set to the deployed backend's absolute URL (**including the `/api` suffix**) in Vercel's Environment Variables for production — otherwise requests go to Vercel's own domain instead of Render's, and (now that `vercel.json` has a catch-all rewrite) silently get back `index.html` instead of JSON.
+
+---
+
+## 0.6 Admin: manage individual movies + smarter bulk ingestion
+
+### Bulk PDF upload no longer re-embeds movies it already has
+
+Old order was parse → embed (every movie, including ones already in
+the DB) → reconcile. Re-uploading the same or an overlapping PDF
+burned embedding-API calls on movies that hadn't changed at all.
+`server/ingestJob.js` now reconciles (a single cheap Neo4j read)
+**before** embedding, and only the genuinely-new movies go through
+embedding + the Pinecone/Neo4j write. Movies that already exist are
+skipped entirely by this path — updating one is now a deliberate
+action via the single-movie edit feature below, not an implicit
+side-effect of re-uploading a PDF.
+
+### Add / edit / delete one movie (`src/ingestion/movieCrud.js`)
+
+New routes: `GET /api/movies` (search/list), `GET /api/movies/:id`,
+`POST /api/movies` (add), `PUT /api/movies/:id` (edit), `DELETE
+/api/movies/:id`. Every mutating call writes to **both** Neo4j and
+Pinecone — never just one — and returns a `log` array of what it did
+(embedding generated, Neo4j written, Pinecone written) so the Admin
+UI isn't just a spinner for a few seconds.
+
+**Edit — known, documented limitation:** editing a movie fully
+replaces its own direct relationships (`DIRECTED_BY`/`ACTED_IN`/
+`HAS_GENRE`/`WON_AWARD`/`IN_LANGUAGE`/`FROM_COUNTRY`) — remove an
+actor from the cast and their `ACTED_IN` edge to this movie goes too.
+It does **not** retroactively correct the aggregate cross-movie stats
+(`Actor-[:WORKED_IN_GENRE]->Genre` with a `count` property, `Actor-
+[:CO_STARRED_WITH]-Actor`) that this movie's *old* data already
+incremented — those only ever increment, same pre-existing behavior
+as the bulk loader (`neo4jLoader.js`) always had. A full correction
+would need a graph rebuild; out of scope here.
+
+`client/src/components/MovieForm.jsx` is the shared add/edit form —
+fields match `pdfParser.js`'s real schema exactly (nothing invented).
+Admin flow: **Add new movie** → fill in → submit → "Add another
+movie" resets the form without leaving the page, so several movies
+can be added back-to-back. **Edit or delete existing movie** →
+search by title → pick one → form pre-fills → save (updates) or
+delete (removes from both stores, with a confirm prompt first).
+
+### Full log visibility during PDF ingestion
+
+`pdfParser.js`/`embedder.js`/`pineconeLoader.js`/`neo4jLoader.js`/
+`idReconciler.js` already print rich batch-level progress
+(`console.log`/`warn`/`error` — "batch 3/7", "upserting...", etc.) —
+before this, only Render's own server logs saw those lines; the
+Admin UI polling `/api/upload/status/:id` only ever saw the handful
+of milestone lines `ingestJob.js` wrote manually. `runIngestJob()` now
+temporarily wraps `console.log`/`warn`/`error` for the duration of the
+job (`withCapturedConsole()`) so every one of those lines lands in the
+job's own log too — still also printing to the real console, so
+Render's logs aren't silenced. Assumes one ingestion job at a time
+(realistic for a single-admin app); concurrent jobs would interleave
+in each other's captured log.
+
+`ProgressLog.jsx` now also colors lines containing `❌`/`⚠️`
+distinctly, and a failed PDF ingestion surfaces which specific movies
+failed to embed (`result.failedMovies`) in their own callout — so
+re-uploading the same PDF (which resumes via the cache) can be
+understood as "retrying just these," not a mystery restart.
 
 ---
 

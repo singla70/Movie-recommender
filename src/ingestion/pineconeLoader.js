@@ -46,6 +46,9 @@ async function upsertBatchWithRetry(index, vectors, batchNum, totalBatches) {
   console.error(
     `  ❌ Pinecone batch ${batchNum}/${totalBatches} upsert failed after ${RETRY.MAX_ATTEMPTS} attempts: ${lastErr.message.substring(0, 100)}`
   );
+  console.error(
+    `     Affected movies: ${vectors.map((v) => `${v.metadata?.title || v.id} (${v.id})`).join(", ")}`
+  );
   return false;
 }
 

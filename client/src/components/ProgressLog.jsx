@@ -9,6 +9,7 @@ export default function ProgressLog({ lines, stage }) {
 
   const stageLabel = {
     parsing: "Parsing PDF",
+    reconciling: "Checking for existing movies",
     embedding: "Generating embeddings",
     loading: "Writing to Pinecone + Neo4j",
     done: "Complete",
@@ -27,7 +28,16 @@ export default function ProgressLog({ lines, stage }) {
         {lines.length === 0 ? (
           <span className="text-theatre-faint">Log output will appear here…</span>
         ) : (
-          lines.map((line, i) => <div key={i}>{line}</div>)
+          lines.map((line, i) => (
+            <div
+              key={i}
+              className={
+                line.includes("❌") ? "text-gold" : line.includes("⚠️") ? "text-theatre-muted/80" : undefined
+              }
+            >
+              {line}
+            </div>
+          ))
         )}
       </div>
     </div>

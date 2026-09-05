@@ -106,5 +106,16 @@ export const api = {
   // re-parsing/re-embedding from scratch.
   retryUpload: (jobId) => request(`/upload/retry/${jobId}`, { method: "POST" }),
 
+  // Single-movie management — admin's "add/edit/delete one movie"
+  // feature. Every mutating call gets a `log` array back in the
+  // response (see server/index.js) so the UI can show what actually
+  // happened (embedding generated, Neo4j written, Pinecone written)
+  // instead of the request just going quiet for a few seconds.
+  listMovies: (search = "") => request(`/movies?search=${encodeURIComponent(search)}`),
+  getMovie: (id) => request(`/movies/${id}`),
+  addMovie: (movie) => request("/movies", { method: "POST", body: JSON.stringify(movie) }),
+  updateMovie: (id, movie) => request(`/movies/${id}`, { method: "PUT", body: JSON.stringify(movie) }),
+  deleteMovie: (id) => request(`/movies/${id}`, { method: "DELETE" }),
+
   connections: () => request("/connections"),
 };
