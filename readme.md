@@ -16,8 +16,9 @@ movie-graph-rag/
 ├── src/                ← core RAG logic (query + ingestion), shared by app.js AND the API
 │   └── query/queryEngine.js   ← stateless wrapper around app.js's query logic, used by server/
 ├── server/              ← Express API (bridge for the React frontend)
-│   ├── index.js          ← routes: /api/query, /api/stats, /api/upload, /api/upload/status/:id, /api/connections
-│   └── ingestJob.js       ← background PDF-ingestion job runner (polled by the Admin UI)
+│   ├── index.js          ← routes: /api/query, /api/query/stream (SSE), /api/stats, /api/upload,
+│   │                        /api/upload/status/:id, /api/upload/retry/:id, /api/connections
+│   └── ingestJob.js       ← background PDF-ingestion job runner (polled by the Admin UI) — resumable, see §7
 └── client/               ← React + Vite + Tailwind frontend ("Cinegraph")
     └── src/
         ├── pages/         ← Landing, QueryMode, AdminMode
@@ -43,6 +44,102 @@ npm run client:dev
 Then open `http://localhost:5173`. The CLI chatbot (`npm start`) still works independently and is untouched — the API server reuses the same `src/query/*` and `src/ingestion/*` modules through the new stateless `queryEngine.js`, rather than duplicating logic.
 
 `npm run client:build` builds the production frontend bundle into `client/dist/`.
+
+---
+
+## 0.5 What changed after the first deployment
+
+Sections 1+ below are the original audit pass. Everything in this
+section happened afterward, once the app was actually live on
+Vercel (frontend) + Render (backend) and real usage surfaced real
+problems. Kept as its own section so the "why" isn't lost.
+
+### Query progress is real, not simulated
+
+`server/index.js` exposes `POST /api/query/stream` (Server-Sent
+Events) alongside the original `POST /api/query`. `queryEngine.js`'s
+`processQuery()` takes an optional `onStage(stage)` callback, invoked
+at each real pipeline transition — routing decided, which store is
+being searched (`vector` / `graph` / `hybrid` / `multi_query`),
+answer being composed. The frontend (`QueryMode.jsx`) renders these
+verbatim ("Searching Neo4j — graph traversal…" etc.) instead of a
+generic spinner. `/api/query` (plain JSON) is kept for non-browser
+callers (curl, scripts).
+
+If an LLM provider in the fallback chain (`openrouterClient.js`:
+Groq → OpenRouter free → OpenRouter paid) is slow and falls back,
+`onRetry(info)` fires too, so the UI can say `"groq" is slow —
+falling back to "openrouter-free"…` instead of sitting on "Reading
+your question" for up to 75s with no explanation.
+
+**Timeout budget** — a single `chatCompletion()` call can
+structurally take up to 225s in the worst case (3 providers × 75s
+each) if every provider is genuinely unreachable, and `processQuery`
+makes up to two such calls per request (routing + answer). The
+stream endpoint's hard timeout (`STREAM_HARD_TIMEOUT_MS`) is set to
+240s — comfortably above one full chain-exhaustion, so a legitimately
+recovering (if slow) request is never killed mid-fallback; it only
+fires for something stuck well beyond the system's own worst case.
+The frontend has its own 260s belt-and-suspenders abort in case the
+network connection itself stalls and the server's own timeout never
+arrives.
+
+### Resumable ingestion + duplicate prevention
+
+`src/ingestion/idReconciler.js` (title+year matching against the
+existing DB, reusing the existing node's id instead of minting a new
+one) existed before this pass but was **only wired into
+`scripts/migrate.js`**, a one-off maintenance script — the actual
+live upload path (`server/ingestJob.js`, used by the Admin page) never
+called it. Re-uploading a PDF containing a movie already in the
+database created a duplicate `Movie` node + a duplicate Pinecone
+vector instead of updating the existing one. `runIngestJob()` now
+calls `reconcileMovieIds()` before writing, and the job result reports
+`{ matched, newMovies }` so the Admin UI can say "3 new, 12 updated"
+instead of just a raw count.
+
+Parsing (LLM calls) and embedding (embedding-API calls) are the
+expensive steps — `scripts/ingest.js` already cached them to disk so
+a failed manual run could resume without re-paying that cost
+(`CACHE_FILE`), but `server/ingestJob.js` had no such cache: any
+failure (rate limit, a DB blip, anything) meant the next attempt
+re-parsed and re-embedded the whole PDF from zero. `ingestJob.js` now
+keeps the same pattern, keyed by the uploaded PDF's SHA-256 hash
+(`server/uploads/.cache/<hash>.json`): whichever stage last completed
+is skipped on retry. `POST /api/upload/retry/:jobId` re-runs
+ingestion against the *same* uploaded file (kept on disk specifically
+for this) under a new job id, so the Admin page's "Retry" button
+resumes rather than restarts. The cache file is deleted on success.
+
+### Hardening (found during a backend audit, not from a live incident)
+
+| Issue | Before | After |
+|---|---|---|
+| CORS | `cors()` — reflects any origin | Same by default (no breaking change); set `ALLOWED_ORIGINS` (comma-separated) to restrict to known frontend domain(s) once the API is public |
+| Rate limiting | none | `express-rate-limit` on `/api/query`, `/api/query/stream` (12/min/IP default) and `/api/upload` (5/10min/IP default) — the LLM provider chain's free-tier quota is shared across every visitor, so unrestricted access risked one visitor (or a bot) exhausting it for everyone |
+| JSON body limit | Express default (100kb) | 2MB — a long chat's `conversation_history` (resent in full every turn, see §0's stateless-history note) could plausibly exceed the default eventually |
+| Uncaught errors | no process-level handler | `unhandledRejection` / `uncaughtException` now log clearly instead of an unexplained silent crash |
+| Shutdown | Neo4j driver never explicitly closed | `SIGTERM`/`SIGINT` handler closes it cleanly before exit |
+| Pinecone index lookup | `getPineconeIndex()` called `client.listIndexes()` (a control-plane API round-trip) on **every single query**, despite the index never changing at runtime after initial creation | Existence is confirmed once per process (`_confirmedIndexes` Set) and never re-checked — removes ~100–300ms of pure latency from every query |
+| Cypher injection | — | Audited: every graph query already uses parameterized `runQuery(cypher, params)`, no string-interpolated Cypher found. No changes needed. |
+
+**Noted but not changed** (flagged for a future pass, not urgent):
+`multer@1.x` has older security advisories; `multer@2.x` fixes them
+but wasn't upgraded here since its multipart-parsing behavior wasn't
+re-tested. `express`'s transitive `qs` dependency carries two
+moderate-severity DoS-class advisories (pre-existing, unrelated to
+anything added in this pass) that only a major Express version bump
+would clear. `server/ingestJob.js`'s in-memory `jobs` Map grows
+unbounded (one entry per upload, never cleaned up) — fine at
+portfolio scale, not fine indefinitely.
+
+### Frontend
+
+- **Sidebar** — mobile: off-canvas drawer (hamburger topbar, backdrop-tap-to-close, Escape-to-close), desktop: drag-to-resize (200–340px) + collapse-to-icon-rail, both persisted to `localStorage`.
+- **Chat** — copy button and regenerate button (re-asks the same preceding user query with the conversation truncated after it, same convention as ChatGPT/Claude) on every assistant message; Cancel button while a query is in flight (`AbortController`); "New chat" clears the thread.
+- **Movie cards** — click to expand: full cast list, all genres, Oscar-nomination count, match-confidence — fields `responseBuilder.js` already sends but the collapsed row had no room for. Nothing invented; the (already-truncated) plot isn't any longer than what the collapsed view showed.
+- **`client/vercel.json`** — added a SPA catch-all rewrite (`/(.*) → /index.html`). Without it, refreshing `/query` or `/admin` directly hit Vercel's static host looking for a literal file at that path and 404'd — React Router only ever sees a route after `index.html` loads and its JS runs.
+- **`VITE_API_URL`** — `client/src/api.js`'s `BASE` reads `import.meta.env.VITE_API_URL`, falling back to the relative `/api` (which `vite.config.js`'s dev-server proxy forwards to `localhost:4000`) only for local `npm run client:dev`. Must be set to the deployed backend's absolute URL (**including the `/api` suffix**) in Vercel's Environment Variables for production — otherwise requests go to Vercel's own domain instead of Render's, and (now that `vercel.json` has a catch-all rewrite) silently get back `index.html` instead of JSON.
 
 ---
 

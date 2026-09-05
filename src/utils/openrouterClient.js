@@ -164,7 +164,13 @@ async function tryProvider(provider, messages, maxTokens) {
 // mein. Koi bhi tier fail ho (timeout, rate-limit, unavailable,
 // insufficient credits — koi bhi error) toh agli tier try hoti hai.
 // Sab tiers fail ho jaayein tabhi error throw hota hai.
-export async function chatCompletion(model, messages, maxTokens = 1024) {
+//
+// onRetry(info): optional — jab bhi ek provider fail hoke agle pe
+// fallback hota hai, turant call hota hai (before the next attempt
+// starts, not after). Callers (queryRouter etc) isse UI tak stream
+// kar sakte hain, taaki 75s+ ki chup wait ke bajaye "Groq slow hai,
+// OpenRouter try kar rahe hain..." jaisa real status dikhe.
+export async function chatCompletion(model, messages, maxTokens = 1024, onRetry) {
   let lastErr = null;
 
   for (let i = 0; i < PROVIDER_CHAIN.length; i++) {
@@ -183,6 +189,7 @@ export async function chatCompletion(model, messages, maxTokens = 1024) {
         console.warn(
           `  ⚠️  "${provider.name}" (${provider.model}) ${reason} — falling back to "${next.name}" (${next.model})...`
         );
+        onRetry?.({ from: provider.name, to: next.name, reason });
       }
     }
   }

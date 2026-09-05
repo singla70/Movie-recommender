@@ -87,7 +87,9 @@ async function executeSingleQuery(queryInfo, conversationHistory) {
 //   {stage:"composing",  route:<same as above>}     — results in hand, writing the answer
 export async function processQuery(userQuery, conversationHistory = [], lastMovies = [], onStage = () => {}) {
   onStage({ stage: "understanding" });
-  const routing = await routeQuery(userQuery, conversationHistory);
+  const routing = await routeQuery(userQuery, conversationHistory, (retry) =>
+    onStage({ stage: "understanding", retry })
+  );
 
   if (routing.query_type === "greeting") {
     onStage({ stage: "responding", route: "greeting" });

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { Link } from "react-router-dom";
-import { ArrowUpRight, RefreshCw, WifiOff } from "lucide-react";
+import { ArrowUpRight, RefreshCw, WifiOff, RotateCcw } from "lucide-react";
 import UploadDropzone from "../components/UploadDropzone.jsx";
 import ProgressLog from "../components/ProgressLog.jsx";
 import StatBar from "../components/StatBar.jsx";
@@ -12,6 +12,8 @@ export default function AdminMode({ connected }) {
   const [jobId, setJobId] = useState(null);
   const [stage, setStage] = useState(null);
   const [lines, setLines] = useState([]);
+  const [result, setResult] = useState(null);
+  const [retrying, setRetrying] = useState(false);
   const pollRef = useRef(null);
 
   useEffect(() => {
@@ -33,15 +35,21 @@ export default function AdminMode({ connected }) {
 
   async function handleFile(file) {
     setLines([`Uploading ${file.name}…`]);
+    setResult(null);
     setStage("uploading");
     try {
       const { jobId } = await api.uploadPdf(file);
-      setJobId(jobId);
-      pollRef.current = setInterval(() => pollJob(jobId), 1500);
+      startPolling(jobId);
     } catch (err) {
       setStage("error");
       setLines((prev) => [...prev, `Upload failed: ${err.message}`]);
     }
+  }
+
+  function startPolling(id) {
+    setJobId(id);
+    clearInterval(pollRef.current);
+    pollRef.current = setInterval(() => pollJob(id), 1500);
   }
 
   async function pollJob(id) {
@@ -51,15 +59,34 @@ export default function AdminMode({ connected }) {
       setLines(job.log || []);
       if (job.stage === "done" || job.stage === "error") {
         clearInterval(pollRef.current);
-        if (job.stage === "done") refreshStats();
+        if (job.stage === "done") {
+          setResult(job.result);
+          refreshStats();
+        }
       }
     } catch {
       clearInterval(pollRef.current);
     }
   }
 
-  const busy = stage && stage !== "done" && stage !== "error";
+  async function retry() {
+    if (!jobId) return;
+    setRetrying(true);
+    try {
+      const { jobId: newJobId } = await api.retryUpload(jobId);
+      setStage("queued");
+      setLines((prev) => [...prev, "Retrying — resuming from whatever already completed…"]);
+      startPolling(newJobId);
+    } catch (err) {
+      setLines((prev) => [...prev, `Retry failed: ${err.message}`]);
+    } finally {
+      setRetrying(false);
+    }
+  }
+
+  const busy = stage && !["done", "error"].includes(stage);
   const justFinished = stage === "done";
+  const failed = stage === "error";
 
   return (
     <div className="flex-1 overflow-y-auto px-5 py-8 md:px-8">
@@ -67,6 +94,7 @@ export default function AdminMode({ connected }) {
         <h1 className="font-display text-lg text-theatre-text">Admin</h1>
         <p className="mt-1 text-xs text-theatre-muted">
           Upload a PDF of your film catalogue — it's parsed, embedded, and written into the graph and vector index.
+          Movies already in the database are updated, not duplicated.
         </p>
 
         {connected === false && (
@@ -86,15 +114,44 @@ export default function AdminMode({ connected }) {
           </div>
         )}
 
-        {justFinished && (
-          <div className="mt-4 flex items-center justify-between gap-3 rounded-md border border-teal/30 bg-teal/10 px-4 py-3">
-            <p className="text-xs text-theatre-text">Catalogue updated — new titles are searchable now.</p>
-            <Link
-              to="/query"
-              className="inline-flex shrink-0 items-center gap-1 text-xs font-medium text-teal transition-colors hover:text-teal-soft"
+        {failed && (
+          <div className="mt-4 flex items-center justify-between gap-3 rounded-md border border-gold/30 bg-gold/10 px-4 py-3">
+            <p className="text-xs text-theatre-text">
+              Ingestion failed. Whatever already completed is cached — retrying resumes instead of starting over.
+            </p>
+            <button
+              onClick={retry}
+              disabled={retrying || connected === false}
+              className="flex shrink-0 items-center gap-1.5 rounded-md border border-gold/40 px-3 py-1.5 text-xs font-medium text-gold transition-colors hover:bg-gold/10 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              Query it now <ArrowUpRight size={13} />
-            </Link>
+              <RotateCcw size={13} strokeWidth={1.75} className={retrying ? "animate-spin" : ""} />
+              Retry
+            </button>
+          </div>
+        )}
+
+        {justFinished && (
+          <div className="mt-4 rounded-md border border-teal/30 bg-teal/10 px-4 py-3">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-xs text-theatre-text">
+                {result ? (
+                  <>
+                    {result.newMovies > 0 && `${result.newMovies} new movie${result.newMovies === 1 ? "" : "s"} added`}
+                    {result.newMovies > 0 && result.matched > 0 && ", "}
+                    {result.matched > 0 && `${result.matched} existing movie${result.matched === 1 ? "" : "s"} updated`}
+                    {!result.newMovies && !result.matched && "Catalogue updated"} — searchable now.
+                  </>
+                ) : (
+                  "Catalogue updated — new titles are searchable now."
+                )}
+              </p>
+              <Link
+                to="/query"
+                className="inline-flex shrink-0 items-center gap-1 text-xs font-medium text-teal transition-colors hover:text-teal-soft"
+              >
+                Query it now <ArrowUpRight size={13} />
+              </Link>
+            </div>
           </div>
         )}
 

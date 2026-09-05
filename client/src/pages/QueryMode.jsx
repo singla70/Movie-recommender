@@ -15,7 +15,8 @@ const STARTERS = [
 // that instant, not a generic spinner label.
 function stageLabel(stage) {
   if (!stage) return "Thinking…";
-  const { stage: name, route } = stage;
+  const { stage: name, route, retry } = stage;
+  if (retry) return `"${retry.from}" is slow — falling back to "${retry.to}"…`;
   if (name === "understanding") return "Reading your question…";
   if (name === "responding") return route === "greeting" ? "Saying hello…" : "Redirecting to movies…";
   if (name === "searching") {
@@ -36,12 +37,48 @@ export default function QueryMode({ connected }) {
   const [stage, setStage] = useState(null);
   const scrollRef = useRef(null);
   const abortRef = useRef(null);
+  const userCancelledRef = useRef(false);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, loading, stage]);
 
   useEffect(() => () => abortRef.current?.abort(), []); // cancel any in-flight request on unmount
+
+  // Shared runner — both a fresh send and a regenerate ultimately need
+  // the same streaming/timeout/abort/error mechanics, just different
+  // history and a different place to put the result. Returns the
+  // assistant message object (success) — throws AbortError/Error on
+  // failure so callers render it their own way.
+  async function runQuery(query_text, history) {
+    const controller = new AbortController();
+    abortRef.current = controller;
+    userCancelledRef.current = false;
+
+    // Belt-and-suspenders: the server has its own ~240s hard timeout
+    // (server/index.js), matched to the LLM provider chain's own
+    // worst-case latency — but if the network connection itself
+    // stalls (e.g. a proxy silently drops the stream) that server-side
+    // error might never arrive. Set slightly above the server's cap
+    // so the server's clearer error message wins in the normal case.
+    const clientTimeout = setTimeout(() => controller.abort(), 260000);
+
+    try {
+      const data = await api.queryStream(query_text, history, setStage, controller.signal);
+      return { role: "assistant", text: data.answer, movies: data.movies, route: data.route };
+    } catch (err) {
+      if (err.name === "AbortError") {
+        const text = userCancelledRef.current
+          ? "Cancelled."
+          : "This took longer than expected and timed out. The backend or an LLM provider may be slow/unreachable right now — try again in a bit.";
+        return { role: "assistant", text, route: null };
+      }
+      return { role: "assistant", text: `Something went wrong: ${err.message}`, route: null };
+    } finally {
+      clearTimeout(clientTimeout);
+      abortRef.current = null;
+    }
+  }
 
   async function send(text) {
     const query_text = (text ?? input).trim();
@@ -53,32 +90,37 @@ export default function QueryMode({ connected }) {
     setLoading(true);
     setStage(null);
 
-    const controller = new AbortController();
-    abortRef.current = controller;
+    const result = await runQuery(query_text, history);
+    setMessages((prev) => [...prev, result]);
+    setLoading(false);
+    setStage(null);
+  }
 
-    try {
-      const data = await api.queryStream(query_text, history, setStage, controller.signal);
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", text: data.answer, movies: data.movies, route: data.route },
-      ]);
-    } catch (err) {
-      if (err.name === "AbortError") {
-        setMessages((prev) => [...prev, { role: "assistant", text: "Cancelled.", route: null }]);
-      } else {
-        setMessages((prev) => [
-          ...prev,
-          { role: "assistant", text: `Something went wrong: ${err.message}` },
-        ]);
-      }
-    } finally {
-      setLoading(false);
-      setStage(null);
-      abortRef.current = null;
-    }
+  // Regenerating message at `assistantIndex` re-asks the user query
+  // right before it, using only the conversation up to that point —
+  // and drops everything after (same convention as ChatGPT/Claude:
+  // later turns were responses to the answer that's being replaced,
+  // so they can't stay as-is).
+  async function regenerate(assistantIndex) {
+    if (loading) return;
+    const userIndex = assistantIndex - 1;
+    if (userIndex < 0 || messages[userIndex]?.role !== "user") return;
+
+    const query_text = messages[userIndex].text;
+    const history = messages.slice(0, userIndex).map((m) => ({ role: m.role, content: m.text }));
+
+    setMessages((prev) => prev.slice(0, assistantIndex));
+    setLoading(true);
+    setStage(null);
+
+    const result = await runQuery(query_text, history);
+    setMessages((prev) => [...prev, result]);
+    setLoading(false);
+    setStage(null);
   }
 
   function cancel() {
+    userCancelledRef.current = true;
     abortRef.current?.abort();
   }
 
@@ -135,7 +177,12 @@ export default function QueryMode({ connected }) {
         ) : (
           <div className="mx-auto flex max-w-3xl flex-col gap-6">
             {messages.map((m, i) => (
-              <ChatMessage key={i} {...m} />
+              <ChatMessage
+                key={i}
+                {...m}
+                onRegenerate={m.role === "assistant" ? () => regenerate(i) : undefined}
+                regenerateDisabled={loading}
+              />
             ))}
             {loading && (
               <div className="flex items-center gap-3 pl-10 text-xs text-theatre-muted">

@@ -101,5 +101,10 @@ export const api = {
 
   jobStatus: (jobId) => request(`/upload/status/${jobId}`),
 
+  // Re-runs a failed upload on the same PDF — the backend's disk
+  // cache resumes from whatever stage last completed rather than
+  // re-parsing/re-embedding from scratch.
+  retryUpload: (jobId) => request(`/upload/retry/${jobId}`, { method: "POST" }),
+
   connections: () => request("/connections"),
 };

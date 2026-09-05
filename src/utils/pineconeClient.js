@@ -18,6 +18,13 @@ if (!PINECONE_API_KEY) {
 }
 
 let _client = null;
+// Confirmed-existing index names — set once we've verified an index
+// is there, never invalidated. Avoids an extra listIndexes() control-
+// plane round-trip on EVERY query/embedding call forever after the
+// first — the index is created once at ingestion time and never
+// renamed/deleted while the app is running, so re-checking every
+// single request was pure wasted latency (~100-300ms) with no benefit.
+const _confirmedIndexes = new Set();
 
 export function getPineconeClient() {
   if (!_client) {
@@ -26,25 +33,28 @@ export function getPineconeClient() {
   return _client;
 }
 
-// ── Index lao — cache nahi karte (race condition fix) ────────
+// ── Index lao — existence check sirf ek baar hoti hai per index name ──
 export async function getPineconeIndex(indexName, dimension) {
   const client = getPineconeClient();
 
-  const existingIndexes = await client.listIndexes();
-  const indexNames = existingIndexes.indexes?.map((i) => i.name) || [];
+  if (!_confirmedIndexes.has(indexName)) {
+    const existingIndexes = await client.listIndexes();
+    const indexNames = existingIndexes.indexes?.map((i) => i.name) || [];
 
-  if (!indexNames.includes(indexName)) {
-    console.log(`📦 Creating new Pinecone index: "${indexName}"...`);
-    await client.createIndex({
-      name: indexName,
-      dimension,
-      metric: "cosine",
-      spec: { serverless: { cloud: "aws", region: "us-east-1" } },
-    });
-    console.log("⏳ Waiting for index to be ready...");
-    await waitForIndexReady(client, indexName);
-  } else {
-    console.log(`✅ Pinecone index "${indexName}" already exists.`);
+    if (!indexNames.includes(indexName)) {
+      console.log(`📦 Creating new Pinecone index: "${indexName}"...`);
+      await client.createIndex({
+        name: indexName,
+        dimension,
+        metric: "cosine",
+        spec: { serverless: { cloud: "aws", region: "us-east-1" } },
+      });
+      console.log("⏳ Waiting for index to be ready...");
+      await waitForIndexReady(client, indexName);
+    } else {
+      console.log(`✅ Pinecone index "${indexName}" already exists.`);
+    }
+    _confirmedIndexes.add(indexName);
   }
 
   // v7 recommended: object syntax with name

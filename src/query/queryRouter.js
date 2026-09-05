@@ -39,7 +39,7 @@ AVAILABLE TOOLS (use exact tool names):
 22. search_director_filmography(director: string)
 `;
 
-export async function routeQuery(userQuery, conversationHistory = []) {
+export async function routeQuery(userQuery, conversationHistory = [], onRetry) {
   const recentHistory = conversationHistory.slice(-6)
     .map(m => `${m.role === "user" ? "User" : "Assistant"}: ${m.content.substring(0, 120)}`)
     .join("\n");
@@ -120,10 +120,11 @@ Other notes:
   const response = await chatCompletion(
     MODELS.LLM,
     [{ role: "user", content: prompt }],
-    1000 // 600 se badhaya — complex/multi-query responses truncate ho
+    1000, // 600 se badhaya — complex/multi-query responses truncate ho
     // rahe the (live-testing mein "⚠️ JSON repair: sab attempts fail"
     // dikha, raw response mid-JSON cut off tha "...inten" jaisa —
     // ye 600-token cap se hi pura output nahi aa pa raha tha)
+    onRetry
   );
 
   try {

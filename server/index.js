@@ -27,19 +27,64 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { randomUUID } from "crypto";
+import rateLimit from "express-rate-limit";
 
 import { processQuery } from "../src/query/queryEngine.js";
 import { getNeo4jStats } from "../src/ingestion/neo4jLoader.js";
-import { getNeo4jDriver } from "../src/utils/neo4jClient.js";
-import { runIngestJob, getJob } from "./ingestJob.js";
+import { getNeo4jDriver, closeNeo4jDriver } from "../src/utils/neo4jClient.js";
+import { runIngestJob, getJob, retryJob } from "./ingestJob.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+
+// ── CORS ────────────────────────────────────────────────────
+// Open by default (backward-compatible — no env var required to keep
+// working exactly as before). Set ALLOWED_ORIGINS (comma-separated,
+// e.g. "https://movie-recommender-singla2.vercel.app") in production
+// to stop OTHER websites from calling this API directly with your
+// browser's credentials/IP — cors() with no options reflects *any*
+// origin, which is fine for local dev but means anyone could embed
+// calls to this API (and burn the shared free-tier LLM quota) from
+// their own site once the URL is public.
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "").split(",").map((s) => s.trim()).filter(Boolean);
+app.use(
+  cors(
+    allowedOrigins.length > 0
+      ? { origin: allowedOrigins }
+      : undefined // no ALLOWED_ORIGINS set → unrestricted, same as before
+  )
+);
+
+// Conversation history grows with every turn of a chat — Express's
+// default express.json() limit (100kb) is comfortably enough for
+// normal use but not generous; a handful of long turns could hit it
+// and return an opaque 413 rather than an error the frontend explains.
+app.use(express.json({ limit: "2mb" }));
+
+// ── Rate limiting ────────────────────────────────────────────
+// The LLM provider chain (src/utils/openrouterClient.js) shares a
+// FREE-TIER daily/per-minute quota across every visitor — Groq
+// (14,400/day) and OpenRouter's free tier (50/day, much tighter).
+// Without a limit here, a single visitor (accidental refresh-spam,
+// or a bot once the URL is public) could exhaust that shared quota
+// for everyone else. This bounds it per-IP; tune via env if needed.
+const queryLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.QUERY_RATE_LIMIT_PER_MIN) || 12,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many queries from this address — please wait a moment and try again." },
+});
+const uploadLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  limit: Number(process.env.UPLOAD_RATE_LIMIT_PER_10MIN) || 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many uploads from this address — please wait a few minutes and try again." },
+});
 
 const upload = multer({
   dest: UPLOAD_DIR,
@@ -54,7 +99,7 @@ const upload = multer({
 // Plain request/response — kept for simplicity/backward-compatibility
 // (e.g. curl, non-browser clients). The web UI uses /api/query/stream
 // below so it can show real pipeline stages instead of guessing.
-app.post("/api/query", async (req, res) => {
+app.post("/api/query", queryLimiter, async (req, res) => {
   const { query_text, conversation_history } = req.body;
   if (!query_text || !query_text.trim()) {
     return res.status(400).json({ error: "query_text is required" });
@@ -79,7 +124,21 @@ app.post("/api/query", async (req, res) => {
 // reflects an actual transition in queryEngine.js (routing decided,
 // which store is being searched, answer being composed) — not a
 // simulated/fake timer on the client.
-app.post("/api/query/stream", async (req, res) => {
+//
+// HARD_TIMEOUT_MS is a safety net: the LLM provider chain inside
+// chatCompletion() already retries across 3 providers at up to 75s
+// each (see src/utils/openrouterClient.js) — so a SINGLE legitimate
+// full-chain fallback can structurally take up to 225s, and
+// processQuery can make two such calls per request (routing +
+// answer). 240s is set comfortably above one full chain-exhaustion
+// (225s) so a genuinely-recovering request is never killed
+// mid-fallback — it only fires for something actually stuck well
+// beyond the system's own worst case. Combined with the onRetry
+// visibility above, the user sees *why* it's slow instead of a
+// blank wait either way.
+const STREAM_HARD_TIMEOUT_MS = 240000; // 240s
+
+app.post("/api/query/stream", queryLimiter, async (req, res) => {
   const { query_text, conversation_history } = req.body;
   if (!query_text || !query_text.trim()) {
     return res.status(400).json({ error: "query_text is required" });
@@ -93,20 +152,36 @@ app.post("/api/query/stream", async (req, res) => {
   const send = (payload) => res.write(`data: ${JSON.stringify(payload)}\n\n`);
 
   let closed = false;
+  let settled = false;
   req.on("close", () => { closed = true; }); // client cancelled — stop writing, let the query finish quietly
+
+  const hardTimeout = setTimeout(() => {
+    if (settled || closed) return;
+    settled = true;
+    console.error(`Query stream timed out after ${STREAM_HARD_TIMEOUT_MS / 1000}s: "${query_text.slice(0, 80)}"`);
+    send({
+      stage: "error",
+      error: "This is taking much longer than expected — the LLM provider(s) may be unreachable right now. Check the server logs.",
+    });
+    res.end();
+  }, STREAM_HARD_TIMEOUT_MS);
 
   try {
     const history = (conversation_history || []).map((m) => ({ role: m.role, content: m.content }));
     const result = await processQuery(query_text.trim(), history, [], (stage) => {
-      if (!closed) send(stage);
+      if (!closed && !settled) send(stage);
     });
-    if (!closed) {
+    if (!closed && !settled) {
+      settled = true;
+      clearTimeout(hardTimeout);
       send({ stage: "done", ...result });
       res.end();
     }
   } catch (err) {
     console.error("Query stream error:", err);
-    if (!closed) {
+    if (!closed && !settled) {
+      settled = true;
+      clearTimeout(hardTimeout);
       send({ stage: "error", error: err.message || "Query failed" });
       res.end();
     }
@@ -135,7 +210,7 @@ app.get("/api/connections", async (_req, res) => {
 });
 
 // ── POST /api/upload ─────────────────────────────────────────
-app.post("/api/upload", upload.single("pdf"), (req, res) => {
+app.post("/api/upload", uploadLimiter, upload.single("pdf"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No PDF file uploaded" });
 
   const jobId = randomUUID();
@@ -155,12 +230,53 @@ app.get("/api/upload/status/:jobId", (req, res) => {
   res.json(job);
 });
 
+// ── POST /api/upload/retry/:jobId ────────────────────────────
+// Re-runs ingestion on the SAME uploaded PDF a failed job used —
+// the file is kept around specifically for this (see multer/rename
+// above). runIngestJob's disk cache (server/ingestJob.js) is keyed
+// by the file's content hash, so this resumes from whichever stage
+// last completed instead of re-parsing/re-embedding from scratch.
+app.post("/api/upload/retry/:jobId", (req, res) => {
+  const newJobId = randomUUID();
+  const started = retryJob(req.params.jobId, newJobId);
+  if (!started) {
+    return res.status(404).json({ error: "Original upload not found — its file may have been cleaned up. Upload the PDF again." });
+  }
+  res.json({ jobId: newJobId });
+});
+
 // ── Error handler (multer file-type/size errors etc) ─────────
 app.use((err, _req, res, _next) => {
   res.status(400).json({ error: err.message || "Unexpected error" });
 });
 
 const PORT = process.env.API_PORT || 4000;
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`🎬 Cinegraph API listening on http://localhost:${PORT}`);
 });
+
+// ── Don't let one bad async error silently kill the whole process ──
+// Without these, an exception thrown outside a route's own try/catch
+// (a genuine bug, a bad third-party promise, etc.) crashes the entire
+// server with no clean log — on Render that means every in-flight
+// request drops and the container restarts cold. This at least logs
+// clearly what happened; the process still exits (Node's own guidance
+// for unhandledRejection — the process is in an unknown state by then)
+// but the restart is no longer a silent mystery in the logs.
+process.on("unhandledRejection", (reason) => {
+  console.error("💥 Unhandled promise rejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("💥 Uncaught exception:", err);
+  process.exit(1);
+});
+
+// ── Graceful shutdown — close the Neo4j driver cleanly on redeploy ──
+async function shutdown(signal) {
+  console.log(`\n${signal} received — shutting down...`);
+  server.close();
+  await closeNeo4jDriver().catch(() => {});
+  process.exit(0);
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
