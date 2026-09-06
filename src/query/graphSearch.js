@@ -105,6 +105,7 @@ function entitiesToTools(entities, topK) {
 // ── Graph Enrich + Filter (Hybrid mode) ──────────────────────
 export async function graphEnrichAndFilter(vectorCandidates, entities, topK = 10) {
   if (!vectorCandidates || vectorCandidates.length === 0) return [];
+  console.log(`  📊 graphEnrichAndFilter: received ${vectorCandidates.length} vector candidate(s), topK=${topK}`);
 
   const titles = vectorCandidates.map(c => c.title).filter(Boolean);
   if (titles.length === 0) return vectorCandidates.slice(0, topK);
@@ -167,6 +168,7 @@ export async function graphEnrichAndFilter(vectorCandidates, entities, topK = 10
     return { ...m, graphScore: matched / totalCriteria };
   });
 
+  console.log(`  📊 graphEnrichAndFilter: returning ${Math.min(enriched.length, topK)} of ${enriched.length} enriched candidate(s) (after entity filters)`);
   return enriched
     .map(m => ({ ...m, confidenceScore: (m.confidenceScore * 0.7) + ((m.graphScore || 0) * 0.3), confidenceLabel: getLabel(m.confidenceScore), confidenceExplanation: `${m.confidenceExplanation} | Graph enriched (${((m.graphScore||0)*100).toFixed(0)}% criteria match)` }))
     .sort((a, b) => b.confidenceScore - a.confidenceScore)

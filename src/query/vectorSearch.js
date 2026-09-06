@@ -19,6 +19,7 @@ import { CONFIDENCE } from "../config/constants.js";
 export async function getVectorCandidates(userQuery, filter = {}) {
   const queryEmbedding = await generateQueryEmbedding(userQuery);
   const results = await searchSimilarMovies(queryEmbedding, 50, filter);
+  console.log(`  📊 getVectorCandidates: Pinecone returned ${results.length} candidate(s) for "${userQuery}"${Object.keys(filter).length ? ` (filter: ${JSON.stringify(filter)})` : ""}`);
   return results.map(r => ({
     ...r,
     source: "vector",
