@@ -73,3 +73,21 @@ async function waitForIndexReady(client, indexName, maxWaitMs = 60000) {
   }
   throw new Error(`❌ Index "${indexName}" not ready within ${maxWaitMs}ms`);
 }
+
+// ── Vector count — for the Admin stats panel ────────────────────
+// Added specifically to make a real-world bug diagnosable instead of
+// guessed at: Neo4j (graph search, genre/actor/director filters) and
+// Pinecone (semantic/vector search) are two SEPARATE stores that are
+// supposed to stay in sync via the ingestion pipeline, but nothing
+// before this ever surfaced whether they actually agree — a bulk PDF
+// upload that partially failed on the Pinecone side (while Neo4j
+// succeeded) would look invisible: graph-routed queries (genre, actor,
+// director) would keep working fine, while generic/semantic queries
+// silently only searched whatever small number of vectors actually
+// made it into Pinecone.
+export async function getPineconeVectorCount(indexName) {
+  const client = getPineconeClient();
+  const index = client.index({ name: indexName });
+  const stats = await index.describeIndexStats();
+  return stats.totalRecordCount ?? stats.totalVectorCount ?? 0;
+}

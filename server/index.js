@@ -39,6 +39,8 @@ import rateLimit from "express-rate-limit";
 import { processQuery } from "../src/query/queryEngine.js";
 import { getNeo4jStats } from "../src/ingestion/neo4jLoader.js";
 import { getNeo4jDriver, closeNeo4jDriver } from "../src/utils/neo4jClient.js";
+import { getPineconeVectorCount } from "../src/utils/pineconeClient.js";
+import { PINECONE } from "../src/config/constants.js";
 import { runIngestJob, getJob, retryJob } from "./ingestJob.js";
 import { upsertMovie, deleteMovie, getMovieById, listMovies } from "../src/ingestion/movieCrud.js";
 
@@ -239,7 +241,17 @@ app.post("/api/query/stream", queryLimiter, async (req, res) => {
 app.get("/api/stats", async (_req, res) => {
   try {
     const stats = await getNeo4jStats();
-    res.json(stats);
+    // Pinecone count fetched separately and never allowed to fail the
+    // whole response — Neo4j and Pinecone stats matter precisely
+    // because they're independent, so one being briefly unreachable
+    // shouldn't hide the other.
+    let pineconeVectors = null;
+    try {
+      pineconeVectors = await getPineconeVectorCount(PINECONE.INDEX_NAME);
+    } catch (err) {
+      console.error("Pinecone stats fetch failed:", err.message);
+    }
+    res.json({ ...stats, pineconeVectors });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

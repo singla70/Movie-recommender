@@ -113,17 +113,18 @@ async function generateAnswer(userQuery, movies, intent, conversationHistory, is
 
 CRITICAL RULES:
 1. ONLY use information from "DATABASE RESULTS" below. NEVER add info from your own knowledge.
-2. If something is not in the database results, say "not available in database" — do NOT make it up.
-3. ENGLISH ONLY always.
-4. Match output format EXACTLY to what user asked — names only → give only names.
-5. Do NOT show confidence scores or technical terms to user.
+2. If a specific FIELD for a movie is missing (e.g. no rating, no language listed), say "not available in database" for that field — do NOT make it up.
+3. NEVER invent placeholder or filler movie entries to reach a count the user asked for (e.g. if asked for "3 movies" but DATABASE RESULTS below only has 1, list only that 1 — do not add "2. not available in database" or similar fake rows). List exactly as many real movies as are given below, never more.
+4. ENGLISH ONLY always.
+5. Match output format EXACTLY to what user asked — names only → give only names.
+6. Do NOT show confidence scores or technical terms to user.
 ${followupNote}
 
 ${recentHistory ? `Recent conversation:\n${recentHistory}\n` : ""}
 User asked: "${userQuery}"
 Intent: ${intent}
 
-DATABASE RESULTS (use ONLY these):
+DATABASE RESULTS (use ONLY these — there are exactly ${movies.slice(0, 10).length} movie(s) below, no more, no less):
 ${moviesContext}
 
 Format for "${intent}" intent:
