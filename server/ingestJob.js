@@ -77,6 +77,17 @@ export function getJob(jobId) {
   return jobs.get(jobId) || null;
 }
 
+// Same check as server/index.js's upload-time guard — duplicated
+// (not imported) to avoid a circular import (server/index.js already
+// imports FROM this file). Kept in sync manually; it's a tiny, pure
+// function unlikely to drift.
+function isPdfLikelyIntact(buf) {
+  if (!buf || buf.length < 100) return false;
+  if (buf.subarray(0, 5).toString("ascii") !== "%PDF-") return false;
+  const tail = buf.subarray(Math.max(0, buf.length - 2048)).toString("latin1");
+  return tail.includes("%%EOF");
+}
+
 // ── Console.* ko temporarily capture karo isi job ke log mein ──
 async function withCapturedConsole(jobId, fn) {
   const original = { log: console.log, warn: console.warn, error: console.error };
@@ -158,6 +169,15 @@ async function runPipeline(jobId, pdfPath) {
     } else {
       updateJob(jobId, { stage: "parsing" });
       appendLog(jobId, `Reading ${path.basename(pdfPath)}...`);
+      // Defense-in-depth: server/index.js already rejects a truncated/
+      // corrupt upload before a job is ever created, but a Retry on a
+      // job that failed before this check existed could still reach
+      // here with a bad file — catch it with the SAME clear message
+      // instead of repeating "bad XRef entry" and looking like Retry
+      // silently does nothing.
+      if (!fs.existsSync(pdfPath) || !isPdfLikelyIntact(fs.readFileSync(pdfPath))) {
+        throw new Error("This PDF is missing or looks incomplete/corrupted — please upload it again rather than retrying.");
+      }
       parsedMovies = await parsePDFToMovies(pdfPath);
       appendLog(jobId, `Parsed ${parsedMovies.length} movies.`);
       writeCache(hash, { parsedMovies });

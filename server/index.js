@@ -269,8 +269,35 @@ app.get("/api/connections", async (_req, res) => {
 });
 
 // ── POST /api/upload ─────────────────────────────────────────
+// A truncated/interrupted upload produces a file that LOOKS present
+// (multer wrote *something* to disk) but is missing its trailing PDF
+// structure — the cross-reference table (XRef) that pdf-parse needs
+// sits at the END of the file, so a cut-off transfer reliably
+// produces "bad XRef entry" deep inside parsing. Catching this HERE
+// (cheap, synchronous, before a job is even created) means the
+// failure is immediate and the message is actionable — "re-upload"
+// rather than "retry" — instead of surfacing as a cryptic parser
+// error after the job has already started.
+function isPdfLikelyIntact(buf) {
+  if (!buf || buf.length < 100) return false;
+  if (buf.subarray(0, 5).toString("ascii") !== "%PDF-") return false;
+  // %%EOF should appear near the tail — check the last 2KB rather than
+  // requiring it be the literal last bytes (some writers add trailing
+  // whitespace/newlines after it).
+  const tail = buf.subarray(Math.max(0, buf.length - 2048)).toString("latin1");
+  return tail.includes("%%EOF");
+}
+
 app.post("/api/upload", uploadLimiter, upload.single("pdf"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No PDF file uploaded" });
+
+  const fileBuffer = fs.readFileSync(req.file.path);
+  if (!isPdfLikelyIntact(fileBuffer)) {
+    fs.unlinkSync(req.file.path); // corrupt/truncated — nothing useful to keep or retry
+    return res.status(400).json({
+      error: "This PDF looks incomplete or corrupted (the upload may have been interrupted). Please try uploading it again rather than retrying — there's nothing valid here to resume from.",
+    });
+  }
 
   const jobId = randomUUID();
   // .pdf extension zaroori hai — pdf-parse kabhi-kabhi extension-
